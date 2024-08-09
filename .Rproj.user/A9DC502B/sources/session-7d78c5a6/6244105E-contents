@@ -1,0 +1,155 @@
+library(lubridate)
+library(forecast)
+library(dplyr)
+library(parallel)
+library(readr)
+library(ggplot2)
+
+# Load the data
+df <- read_csv("data_23.csv")
+
+# Generate a complete sequence of dates and merge with the original data to fill missing dates
+complete_dates <- data.frame(date = seq.Date(from = min(df$date), to = max(df$date), by = "day"))
+df_complete <- complete_dates %>%
+  left_join(df, by = "date")
+df_complete$n[is.na(df_complete$n)] <- 0
+df_complete$pro <- 11
+# Create time series object
+df_ts <- ts(df_complete$n, start = c(year(min(df_complete$date)), yday(min(df_complete$date))), frequency = 365)
+
+# Prepare exogenous variables
+step1 <- as.numeric(df_complete$date >= as.Date("2020-01-01") & df_complete$date <= as.Date("2022-12-01"))
+step2 <- as.numeric(df_complete$date > as.Date("2022-12-01")) * 2
+step <- step1 + step2
+ramp <- c(rep(0, sum(step == 0)),
+          seq(from = 1, length.out = sum(step == 1), by = 1),
+          seq(from = max(seq(1, sum(step == 1), 1) + 1), length.out = sum(step == 2), by = 2))
+xreg <- cbind(step, ramp)
+
+
+
+
+#-----------------ARIMA--------------------
+# Fit the ARIMA model
+model_arima <- auto.arima(df_ts, seasonal = TRUE,
+                          xreg = xreg, max.p = 10, 
+                          max.q = 10, max.P = 2,
+                          max.Q = 2, max.order = 30,
+                          allowdrift = TRUE, allowmean = FALSE,
+                          approximation = FALSE, ic = "aic", 
+                          max.d = 2, max.D = 1, stepwise = FALSE,
+                          parallel = TRUE)
+
+
+horizon <- 60  # Define your forecast horizon length
+
+# Generate future exogenous variables
+future_step <- rep(max(step) + 1, horizon)
+future_ramp <- seq(max(ramp) + 1, by = 1, length.out = horizon)
+future_xreg <- cbind(future_step, future_ramp)
+
+# Forecast future values
+forecast_arima <- forecast(model_arima, xreg = future_xreg, h = horizon)
+
+fitted_values <- fitted(model_arima)
+
+#---------timegpt-------------
+nixtla_set_api_key(api_key = "nixtla-tok-LVjq2UsYs9uFi5TkLXK57n9rvXiSBsPT9jR4v18SonfNQxw3S4kZL0giPBShayz8BQ9vqDOAJZhJqHtd")
+
+nixtla_client_fcst <- nixtla_client_forecast(df = df_complete, h = horizon, 
+                                             id_col = "pro",
+                                             time_col = "date",
+                                             target_col = "n",
+                                             level = 95)
+
+nixtla_client_fitted_values <- nixtla_client_historic(df_complete, 
+                                                      id_col = "pro", 
+                                                      time_col = "date",
+                                                      target_col = "n",
+                                                      level = 95)
+
+# Align and fill missing Nixtla fitted values
+nixtla_fitted_complete <- df_complete  %>%
+  left_join(nixtla_client_fitted_values %>% mutate(pro = as.numeric(pro)))
+
+# Fill NAs if necessary - here just filling with NA, but consider interpolation if appropriate
+nixtla_fitted_complete$n[is.na(nixtla_fitted_complete$n)] <- NA
+
+
+
+# Prepare a dataframe for plotting
+last_date <- as.Date(tail(df_complete$date, 1))
+future_dates <- seq(from = last_date + 1, by = "day", length.out = horizon)
+
+
+
+
+#-----------------Prophet--------------------
+
+# Prepare data for Prophet
+df_prophet <- df_complete %>%
+  rename(ds = date, y = n)
+
+# Fit the Prophet model
+model_prophet <- prophet(df_prophet)
+
+# Forecast future values
+future_prophet <- make_future_dataframe(model_prophet, periods = horizon)
+forecast_prophet <- predict(model_prophet, future_prophet)
+
+
+
+#-----------------LSTM--------------------
+
+# Prepare data for LSTM
+lstm_data <- df_complete$n
+lstm_data <- scale(lstm_data)  # Normalize data
+
+# Create the LSTM model
+lstm_model <- keras_model_sequential() %>%
+  layer_lstm(units = 50, return_sequences = TRUE, input_shape = c(30, 1)) %>%
+  layer_lstm(units = 50, return_sequences = FALSE) %>%
+  layer_dense(units = 1)
+
+lstm_model %>% compile(
+  loss = 'mean_squared_error',
+  optimizer = 'adam'
+)
+
+# Prepare training data
+X_train <- array(NA, dim = c(length(lstm_data) - horizon, horizon, 1))
+y_train <- array(NA, dim = c(length(lstm_data) - horizon))
+
+for (i in 1:(length(lstm_data) - horizon)) {
+  X_train[i, , ] <- lstm_data[i:(i + horizon - 1)]
+  y_train[i] <- lstm_data[i + horizon]
+}
+
+lstm_model %>% fit(X_train, y_train, epochs = 50, batch_size = 32, verbose = 0)
+
+# Forecast using the LSTM model
+X_test <- array(lstm_data[(length(lstm_data) - horizon + 1):length(lstm_data)], dim = c(1, horizon, 1))
+forecast_lstm <- lstm_model %>% predict(X_test)
+forecast_lstm <- forecast_lstm * attr(lstm_data, "scaled:scale") + attr(lstm_data, "scaled:center")  # Denormalize
+
+
+
+plot_data <- data.frame(
+  Date = c(df_complete$date, future_dates),
+  Value = c(as.numeric(df_ts), rep(NA, horizon)),
+  Fitted_arima = c(fitted_values, as.numeric(forecast_arima$mean)),
+  Fitted_nn = c(nixtla_fitted_complete$TimeGPT, as.numeric(nixtla_client_fcst$TimeGPT)),
+  Type = c(rep("Actual", length(df_ts)), rep("Forecast", horizon))
+)
+
+
+
+ggplot(plot_data, aes(x = Date)) +
+  geom_line(aes(y = Value, colour = "Actual Values"), size = 1.2) +
+  geom_line(aes(y = Fitted_arima, colour = "Fitted/Forecast ARIMA"), size = 1.2, linetype = "dashed") +
+  geom_line(aes(y = Fitted_nn, colour = "Fitted/Forecast TimeGPT"), size = 1.2, linetype = "dotted") +
+  labs(title = "Actual vs Fitted/Forecasted Values", x = "Date", y = "Value") +
+  scale_color_manual("", values = c("Actual Values" = "blue", "Fitted/Forecast ARIMA" = "red", "Fitted/Forecast TimeGPT" = "green")) +
+  theme_minimal()
+
+
